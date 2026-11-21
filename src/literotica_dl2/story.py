@@ -1,5 +1,7 @@
 import html
 import logging
+import re
+from urllib.parse import unquote, urljoin
 
 from bs4 import BeautifulSoup
 from markdownify import MarkdownConverter
@@ -8,10 +10,48 @@ from literotica_dl2.utils import get_url_from_literotica
 
 log = logging.getLogger("literotica_dl.Story")
 
+# Literotica's CSS class names are auto-generated and change whenever the site is redeployed,
+# so this module avoids depending on class names. It relies on page structure and metadata:
+#   - title + category: the og:title <meta> tag ("Title - Category - Literotica.com")
+#   - description:      the description <meta> tag
+#   - author:           the first link of the form /authors/NAME
+#   - story text:       the block holding the most paragraph text
+#   - further pages:    links to <story url>?page=N
+AUTHOR_HREF = re.compile(r"/authors/([^/?#]+)/?$")
+AUTHOR_ANY = re.compile(r"/authors/([^/?#]+)")
+PAGE_NUM = re.compile(r"[?&]page=(\d+)")
+MAX_PAGES = 200  # safety stop
+
 
 # Create shorthand method for conversion
 def md(soup, **options):
     return MarkdownConverter(**options).convert_soup(soup)
+
+
+def _soup(markup: str) -> BeautifulSoup:
+    try:
+        return BeautifulSoup(markup, features="html5lib")
+    except Exception:  # html5lib not installed
+        return BeautifulSoup(markup, features="html.parser")
+
+
+def _meta(soup, *names):
+    """Content of the first <meta> whose name or property matches one of names."""
+    for name in names:
+        tag = soup.find("meta", attrs={"name": name}) or soup.find("meta", attrs={"property": name})
+        if tag is not None and tag.get("content"):
+            return html.unescape(tag["content"]).strip()
+    return None
+
+
+def _story_element(soup):
+    """The block that holds the story text: the one with the most text in its own <p> children."""
+    best, best_len = None, 0
+    for el in soup.find_all(["div", "article", "section"]):
+        n = sum(len(p.get_text()) for p in el.find_all("p", recursive=False))
+        if n > best_len:
+            best, best_len = el, n
+    return best
 
 
 class Story:
@@ -33,25 +73,62 @@ class Story:
         log.info("Getting the initial page for %s", self.story_id)
 
         page = get_url_from_literotica(self.url)
-        self.first_page = BeautifulSoup(page, features="html5lib")
+        self.first_page = _soup(page)
+        soup = self.first_page
 
-        self._title = self.first_page.find("title").getText()
-        self._title = html.unescape(self._title)
-        self._title, self._category = self._title[:-17].rsplit(" - ", 1)
+        # Title and category: "Title - Category - Literotica.com"
+        full = _meta(soup, "og:title")
+        if not full:
+            tag = soup.find("title")
+            full = html.unescape(tag.get_text()).strip() if tag is not None else None
+        if not full:
+            tag = soup.find("h1")
+            full = tag.get_text(strip=True) if tag is not None else self.story_id
+        full = re.sub(r"\s*-\s*Literotica\.com\s*$", "", full, flags=re.I).strip()
+        if " - " in full:
+            self._title, self._category = full.rsplit(" - ", 1)
+        else:
+            self._title, self._category = full, ""
 
-        # Author link class name is y_eU . If the CSS changes update here.
-        self._author = self.first_page.find("a", class_="y_eU").getText()
+        # Author: the first link that points at /authors/NAME (not /authors/NAME/works...)
+        self._author = None
+        for a in soup.find_all("a", href=True):
+            m = AUTHOR_HREF.search(a["href"])
+            if m:
+                self._author = a.get_text(strip=True) or unquote(m.group(1))
+                break
+        if not self._author:
+            for a in soup.find_all("a", href=True):
+                m = AUTHOR_ANY.search(a["href"])
+                if m:
+                    self._author = unquote(m.group(1))
+                    break
+        if not self._author:
+            log.warning("Author not found for %s", self.story_id)
+            self._author = "Unknown"
 
-        # Description dive class name is bn_B.
-        self._description = self.first_page.find("div", class_="bn_B").getText()
+        self._description = _meta(soup, "description", "og:description") or ""
 
-        # Pages link class = l_bJ
-        try:
-            self._pages = int(self.first_page.find_all("a", class_="l_bJ")[-1].getText())
-        except IndexError:
-            self._pages = 1
-        except Exception:
-            log.exception("Error Getting page numbers")
+        # Number of pages as shown by the page links (updated to the real number when the
+        # full story is downloaded, which follows the "next page" links).
+        self._pages = self._count_pages(soup)
+
+    def _count_pages(self, soup) -> int:
+        numbers = [1]
+        for a in soup.find_all("a", href=True):
+            m = PAGE_NUM.search(a["href"])
+            if m and self.story_id in a["href"]:
+                numbers.append(int(m.group(1)))
+        return max(numbers)
+
+    def _next_page(self, soup, current: int):
+        """(number, url) of the link to the page after `current`, or None on the last page."""
+        wanted = current + 1
+        for a in soup.find_all("a", href=True):
+            m = PAGE_NUM.search(a["href"])
+            if m and int(m.group(1)) == wanted and self.story_id in a["href"]:
+                return wanted, urljoin(self.url, a["href"])
+        return None
 
     @property
     def title(self) -> str:
@@ -91,20 +168,30 @@ class Story:
     def populate_full_story(self) -> None:
         if self._pages is None:
             self._fetch_and_parse()
-        # the page css for the story text is aa_ht
-        # since we already have first page no need to get it again.
-        # https://www.literotica.com/s/hot-neighbor-noelle?page=3
-
+        # We already have the first page. Follow the "page N+1" links until there are none,
+        # e.g. https://www.literotica.com/s/hot-neighbor-noelle?page=3
         page_soups = [self.first_page]
-        if self._pages > 1:
-            for pg_no in range(2, self._pages + 1):
-                page_url = f"{self.url}?page={pg_no}"
-                page_soups.append(BeautifulSoup(get_url_from_literotica(page_url), features="html5lib"))
-        story_soups = [x.find("div", class_="aa_ht") for x in page_soups]
-        pages = [x.getText("\n\n") for x in story_soups]
+        current, soup = 1, self.first_page
+        while current < MAX_PAGES:
+            nxt = self._next_page(soup, current)
+            if nxt is None:
+                break
+            current, page_url = nxt
+            soup = _soup(get_url_from_literotica(page_url))
+            page_soups.append(soup)
+        self._pages = len(page_soups)
 
-        self._text = "\n".join([str(x) for x in pages])
-        self._md = "\n".join([md(x) for x in story_soups])
+        texts, markdowns = [], []
+        for number, page_soup in enumerate(page_soups, 1):
+            element = _story_element(page_soup)
+            if element is None:
+                log.warning("No story text found on page %d of %s", number, self.story_id)
+                continue
+            texts.append(element.get_text("\n\n"))
+            markdowns.append(md(element))
+
+        self._text = "\n".join(texts)
+        self._md = "\n".join(markdowns)
 
     @property
     def text(self) -> str:
