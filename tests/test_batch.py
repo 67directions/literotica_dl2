@@ -8,6 +8,8 @@ from literotica_dl2.batch import (
     PROGRESS_FILE,
     Downloader,
     Options,
+    SiteBlocked,
+    looks_blocked,
     parse_author_names,
 )
 
@@ -25,7 +27,7 @@ class World:
         self.fetches = []  # every story address fetched, in order
 
     def add(self, stub, title, text=BODY, fail_times=0, series=None, words=None, category="Romance"):
-        self.stories[stub] = {"title": title, "text": text, "fail": fail_times, "category": category}
+        self.stories[stub] = {"title": title, "text": text, "fail": fail_times, "category": category, "block": False}
         if series:
             sid, stitle = series
             self.series.setdefault(sid, (stitle, []))[1].append(stub)
@@ -55,13 +57,17 @@ def make(tmp_path, world, **overrides):
         def __init__(self, stub):
             world.fetches.append(stub)
             record = world.stories[stub]
+            if record["block"]:
+                raise SiteBlocked(stub)
             if record["fail"] > 0:
                 record["fail"] -= 1
                 raise RuntimeError("timed out")
             self.title, self.text, self.markdown = record["title"], record["text"], "# " + record["text"]
             self.category, self.author = record["category"], "Test_Author"
 
-    options = Options(output=str(tmp_path / "out"), delay=0, author_pause=0, retries=3, **overrides)
+    settings = {"output": str(tmp_path / "out"), "delay": 0, "author_pause": 0, "retries": 3}
+    settings.update(overrides)
+    options = Options(**settings)
     downloader = Downloader(options, author_factory=FakeAuthor, story_factory=FakeStory, series_factory=FakeSeries,
                             sleep=sleeps.append, out=lines.append)
     return downloader, sleeps, lines
@@ -264,3 +270,66 @@ def test_parse_author_names():
 @pytest.mark.parametrize("bad", ["", "   ", "# only a comment"])
 def test_blank_lines_are_ignored(bad):
     assert parse_author_names([bad]) == []
+
+
+CHALLENGE_PAGE = '<!DOCTYPE html><html><head><title>Just a moment...</title></head><body><script>window._cf_chl_opt = {};</script>'
+
+
+def test_looks_blocked():
+    assert looks_blocked(CHALLENGE_PAGE)
+    assert looks_blocked(CHALLENGE_PAGE.encode("utf-8"))
+    assert not looks_blocked("<html><head><title>A Story - Romance - Literotica.com</title></head><body>x</body></html>")
+    assert not looks_blocked("")
+    assert not looks_blocked(b"")
+
+
+def test_a_bot_check_page_stops_the_whole_run_without_retries(tmp_path):
+    world = World()
+    world.add("one", "First Story")
+    world.add("two", "Second Story")
+    world.add("three", "Third Story")
+    world.stories["two"]["block"] = True
+    downloader, sleeps, lines = make(tmp_path, world)
+    results = downloader.run(["Test_Author", "Second_Author"])
+    assert downloader.blocked
+    assert len(results) == 1  # the second author was never started
+    assert world.fetches == ["one", "two"]  # no retry of the blocked story, nothing after it
+    assert sleeps == []  # no retry waits and no pause before another author
+    assert any("bot-check" in line for line in lines)
+    record = json.loads((author_dir(tmp_path) / PROGRESS_FILE).read_text(encoding="utf-8"))
+    assert set(record["stories"]) == {"one"} and record["failed"] == {}  # not marked failed
+    assert not (author_dir(tmp_path) / "failed.txt").exists()
+
+    # later, when the site lets us in, the same command finishes the job
+    world.stories["two"]["block"] = False
+    world.fetches.clear()
+    (again,) = make(tmp_path, world)[0].run(["Test_Author"])
+    assert world.fetches == ["two", "three"]
+    assert (again["downloaded"], again["skipped"], again["failed"]) == (2, 1, 0)
+
+
+def test_an_author_is_put_aside_after_failures_in_a_row(tmp_path):
+    world = World()
+    for n in range(8):
+        world.add(f"s{n}", f"Story {n}", fail_times=99)
+    downloader, _, _ = make(tmp_path, world, retries=0, max_failures=3)
+    (result,) = downloader.run(["Test_Author"])
+    assert world.fetches == ["s0", "s1", "s2"]
+    assert result["failed"] == 3 and "3 failures in a row" in result["problem"]
+
+    world.fetches.clear()
+    (everything,) = make(tmp_path / "again", world, retries=0, max_failures=0)[0].run(["Test_Author"])
+    assert len(world.fetches) == 8 and everything["failed"] == 8
+
+
+def test_a_success_resets_the_failure_streak(tmp_path):
+    world = World()
+    world.add("a", "A", fail_times=99)
+    world.add("b", "B", fail_times=99)
+    world.add("c", "C")
+    world.add("d", "D", fail_times=99)
+    world.add("e", "E", fail_times=99)
+    downloader, _, _ = make(tmp_path, world, retries=0, max_failures=3)
+    (result,) = downloader.run(["Test_Author"])
+    assert world.fetches == ["a", "b", "c", "d", "e"]
+    assert result["problem"] is None and (result["downloaded"], result["failed"]) == (1, 4)

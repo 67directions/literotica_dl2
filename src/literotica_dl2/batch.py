@@ -24,6 +24,10 @@ and adds what the plain command lacks:
   noted in the author's "failed.txt" and the run moves on to the next story instead of stopping.
 * Checks. A page with no story text, or far fewer words than the site says the story has, is
   treated as a failure instead of being saved as an empty or cut-off file.
+* Safety stops. If the site answers with its bot-check page (Cloudflare, "Just a moment...") the
+  whole run stops at once, without retrying and without marking anything as failed. After
+  --max-failures failures in a row an author is put aside for now. Everything saved is kept, and
+  running the same command again carries on.
 * Files are written as UTF-8 and only appear under their final name once complete.
 """
 
@@ -62,6 +66,25 @@ class DownloadError(Exception):
     """A download that failed even after all retries."""
 
 
+class SiteBlocked(Exception):
+    """The site answered with its bot-check page instead of the real page."""
+
+
+# Only the bot-check page contains these; none of the normal pages (author, story, series) do.
+BLOCK_MARKERS = ("<title>just a moment", "cf_chl_opt", "attention required! | cloudflare")
+
+
+def looks_blocked(content) -> bool:
+    """True if `content` (text or bytes) is a bot-check page rather than a real page."""
+    if not content:
+        return False
+    head = content[:20000]
+    if isinstance(head, bytes):
+        head = head.decode("utf-8", "ignore")
+    head = head.lower()
+    return any(marker in head for marker in BLOCK_MARKERS)
+
+
 @dataclass
 class Options:
     output: str = "output"
@@ -71,6 +94,7 @@ class Options:
     author_pause: float = 20.0  # seconds between authors
     poems: bool = False
     min_ratio: float = 0.5  # fewer words than this share of the site's count = failed download
+    max_failures: int = 5  # put an author aside after this many failures in a row (0 = never)
 
 
 @dataclass
@@ -163,6 +187,7 @@ class Downloader:
         self.sleep = sleep
         self.out = out
         self.interrupted = False
+        self.blocked = False
 
     # ----- helpers -------------------------------------------------------------------
 
@@ -178,6 +203,8 @@ class Downloader:
         for attempt in range(self.opts.retries + 1):
             try:
                 return action()
+            except SiteBlocked:
+                raise  # retrying only adds load; the run stops instead
             except Exception as error:  # noqa: BLE001 - any failure is retried, then reported
                 last = f"{type(error).__name__}: {error}"
                 if attempt < self.opts.retries:
@@ -261,6 +288,8 @@ class Downloader:
         self.out(f"\n=== {slug} ===")
         try:
             name, items = self._plan(slug)
+        except SiteBlocked:
+            return self._blocked(result)
         except DownloadError as error:
             result["problem"] = f"could not get the list of works: {error}"
             self.out(f"  {result['problem']}")
@@ -276,9 +305,22 @@ class Downloader:
         extension = ".md" if self.opts.fmt == "md" else ".txt"
         self.out(f"  {len(items)} works to check; saving into {author_dir}")
 
+        streak = 0
         try:
             for number, item in enumerate(items, 1):
+                failed_before, downloaded_before = result["failed"], result["downloaded"]
                 self._handle_item(number, len(items), item, author_dir, extension, progress, result)
+                if result["failed"] > failed_before:
+                    streak += 1
+                elif result["downloaded"] > downloaded_before:
+                    streak = 0
+                if self.opts.max_failures and streak >= self.opts.max_failures:
+                    result["problem"] = (f"stopped after {streak} failures in a row, so something is wrong "
+                                         "(see the messages above). Run the same command later to try again.")
+                    self.out(f"  {result['problem']}")
+                    break
+        except SiteBlocked:
+            self._blocked(result)
         finally:
             self._write_failed_list(author_dir, progress)
 
@@ -335,6 +377,16 @@ class Downloader:
         result["downloaded"] += 1
         result["words"] += words
 
+    def _blocked(self, result: dict) -> dict:
+        self.blocked = True
+        result["problem"] = "stopped: the site is showing its bot-check page instead of the stories"
+        self.out(
+            "\n  The site is showing a bot-check page (Cloudflare, \"Just a moment...\") instead of the real page.\n"
+            "  Stopping now instead of retrying. Everything saved so far is kept, and nothing was marked as failed.\n"
+            "  Wait a good while (hours, not minutes), then run the same command again with a larger --delay."
+        )
+        return result
+
     @staticmethod
     def _write_failed_list(author_dir: Path, progress: Progress) -> None:
         path = author_dir / "failed.txt"
@@ -357,6 +409,8 @@ class Downloader:
             for index, slug in enumerate(slugs):
                 result = self.process_author(slug)
                 results.append(result)
+                if self.blocked:
+                    break
                 if (result["downloaded"] + result["failed"]) and index < len(slugs) - 1:
                     self.sleep(self.opts.author_pause)
         except KeyboardInterrupt:
@@ -392,9 +446,12 @@ def install_pacing(delay: float, sleep=time.sleep, clock=time.monotonic) -> None
             if gap > 0:
                 sleep(gap + random.uniform(0, 0.5))
             try:
-                return function(url)
+                content = function(url)
             finally:
                 state["last"] = clock()
+            if looks_blocked(content):
+                raise SiteBlocked(url)
+            return content
 
         paced._paced = True
         return paced
@@ -437,6 +494,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-ratio", type=float, default=0.5,
                         help="a story with fewer than this share of the site's word count is treated as a failed "
                              "download; 0 turns the check off (default: 0.5)")
+    parser.add_argument("--max-failures", type=int, default=5,
+                        help="put an author aside after this many failed stories in a row; 0 = never (default: 5)")
     parser.add_argument("--poems", action="store_true", help="also download the author's poems")
     parser.add_argument("--clear-cache", action="store_true",
                         help="forget saved pages first (use to pick up an author's new stories)")
@@ -466,11 +525,12 @@ def main(argv=None) -> int:
                 pass
 
     options = Options(output=args.output, fmt=args.format, delay=args.delay, retries=args.retries,
-                      author_pause=args.author_pause, poems=args.poems, min_ratio=args.min_ratio)
+                      author_pause=args.author_pause, poems=args.poems, min_ratio=args.min_ratio,
+                      max_failures=args.max_failures)
     install_pacing(options.delay)
     downloader = Downloader(options)
     results = downloader.run(names)
-    failed = downloader.interrupted or any(r["failed"] or r["problem"] for r in results)
+    failed = downloader.interrupted or downloader.blocked or any(r["failed"] or r["problem"] for r in results)
     return 1 if failed else 0
 
 
